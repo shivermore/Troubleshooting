@@ -1,0 +1,158 @@
+The first thing I would do would be to look in the vmon.log to see if the pre-start script is completing:
+
+grep ‘<vpxd>’ /var/log/vmware/vmon/vmon.log | grep -ivE ‘health|counter’
+
+If you see the pre-start script is failing and vMon isn’t even trying to start the service, open the vmon.log and see what more information is in there. Usual suspects for the pre-start script failing are SSL trust anchor mismatches, or there’s an issue with the /etc/vmware-vpx/vpxd.cfg file (a bungled Retreat Mode is very, very common).
+
+If the pre-start script is successful but the vpxd service is exiting/crashing, I would still have a look at the /etc/vmware-vpx/vpxd.cfg file, namely these two commands:
+
+This will check to see if there is any invalid XML:
+
+xmllint -noout /etc/vmware-vpx/vpxd.cfg && echo $?
+
+If the output is ‘0’, then the XML is at least valid, but one other thing I would check is to ensure that there are no entries that could still crash vpxd (again, we see this often with customers bungling Retreat Mode), so I would recommend running this:
+
+sed -n ‘/<vcls>/,/<\/vcls>/p’ /etc/vmware-vpx/vpxd.cfg
+
+This will pull out everything between the ‘<vcls>’ and ‘</vcls>’ objects, and you’ll have to see if there are the correct objects under those.
+
+Someone already suggested running VDT, which I highly recommend as well.
+
+
+---
+
+
+So, running this -  grep ‘<vpxd>’ /var/log/vmware/vmon/vmon.log | grep -ivE ‘health|counter’  -   it looks like it keeps trying to start vpxd.
+
+This is what I see:
+
+In (05) host-2592 <vpxd> Service pre-start command completed successfully,
+
+In (05) host-2592 <vpxd> Constructed command: /usr/sbin/vpxd
+
+In (05) host-2592 <vpxd> Running the API Health command as user
+
+In (05) host-2592 <vpxd> Service is dumping core. Coredump count 0. CurrReq: 1
+
+In (05) host-2592 <vpxd> Service exited. Exit code 1
+
+This repeats 4 times and then I see
+
+In (05) host-2592 <vpxd> Skip service health check. State STOPPED, Curr request 0
+
+In (05) host-2592 <vpxd> Skip service health check. State STOPPED, Curr request 0
+
+In (05) host-2592 <vpxd> Skip service health check. State STOPPED, Curr request 0
+
+This repeats 7 times and then the process starts over.
+
+---
+
+Ok, so the vmon.log indicates that the vpxd service is crashing (dumping its memory to a core dump).
+
+Can you run the two commands I sent against the /etc/vmware-vpx/vpxd.cfg and report the output? 
+If that turns out clean the only other thing to check would be the /var/log/vmware/vpxd/vpxd.log file itself (assuming it’s getting updated, it depends on at what point the service is crashing).
+
+---
+
+Running this -  xmllint -noout /etc/vmware-vpx/vpxd.cfg && echo $?
+
+Returns an error;
+Vpxd.cfg:50; namespace error : Namespace prefix domain-c15 on a98lbdel-854…….817f is not defined
+
+<domain-c15: a98lbdel-854…….817f>
+
+---
+
+Yep…Retreat Mode…
+
+The object under the ‘<vcls><clusters>’ objects should be ‘<domain-c15>’ (and its corresponding closing tag, ‘</domain-c15>’. The inclusion of the colon and the UUID is causing vpxd to crash.
+
+Edit the file, and then try to start vmware-vpxd. It still won’t start, please post the output of the ‘sed’ command I sent so we can see if there are any other anomalies in that file.
+
+---
+
+looking at the config file. I see this already, I see <domain-c15> entries twice. Should I just remove the lines in red and leave the rest?
+
+I see:
+
+<vcls>
+
+                <clusters>
+
+                                <a98lbdel-854…….817f>
+
+                                                <enabled>false</enabled>
+
+                                </a98lbdel-854…….817f >
+
+                                <domain-c15>
+
+                                                <enabled>false</enabled>
+
+                                </domain-c15>
+
+                                <domain-c15:a98lbdel-854…….817f >
+
+                                                <enabled>false</enabled>
+
+                                </domain-c15:a98lbdel-854…….817f >
+
+                                <domain-c8>
+
+                                                <enabled>true</enabled>
+
+                                </domain-c8>
+
+                </clusters>
+
+</vcls>
+
+---
+
+
+I would remove the lines you indicated in red, but also the first set of objects as well:
+
+                                <a98lbdel-854…….817f>
+
+                                                <enabled>false</enabled>
+
+                                </a98lbdel-854…….817f >
+
+These are not the valid object IDs that the vpxd service will try to lookup, and is also probably contributory to the service crashing.
+
+
+---
+
+Doing it now and crossing my fingers.. =)
+
+Reboot after or just  try so start –all  services?
+
+
+---
+
+
+You can just try to start all, I don’t think a full reboot is necessary.
+
+
+---
+
+
+Vinny. Sorry.. didn’t mean to leave you hanging .. I owe you dinner!   …. Thank You!! vCenter is up and running.
+
+Do you know what caused the “retreat mode” .. I believe it had to do with the customer moving a bunch of hosts in and out of clusters. They had DRS running everywhere, with vCLS VMs on these hosts and tried to move about 10 hosts from various clusters into one cluster at the same time.  They were doing this and vCenter rebooted. When it rebooted it had the HD filecheck errors .. you know the rest of the story after that… LOL
+
+I was just curious what the root cause was.
+
+---
+
+Retreat Mode is a configuration that is enacted when a customer wishes, for whatever reason, to curtail the deployment of the vCLS VMs that control the DRS functions of a cluster 
+(which is now decoupled from vCenter). The process is outlined in the product documentation:
+
+https://docs.vmware.com/en/VMware-vSphere/7.0/com.vmware.vsphere.resmgmt.doc/GUID-F98C3C93-875D-4570-852B-37A38878CE0F.html
+
+The problem with the process is that you have to construct an Advanced Setting string manually, and it is EXTREMELY prone to errors, and unfortunately since that Advanced Setting is stored in the service configuration file 
+rather than the vCenter database, it can cause the service to not start or crash. There is also no input validation when that Advanced Setting is created, and any errors are not always immediately apparent, 
+because it takes a service restart to realize the effects, which sometimes won’t happen for quite some time, so customers don’t correlate the configuration of Retreat Mode to issues encountered with vpxd. 
+We saw this all the time in Global Support. Why this isn’t a toggle switch in the vSphere Client UI is beyond me…
+
